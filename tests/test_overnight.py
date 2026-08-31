@@ -357,6 +357,7 @@ def _trainer_settings(tmp_path: Path, benign_payload: bytes, **overrides) -> Nig
         "ember_tar_path": tar_path,
         "distill_path": tmp_path / "distill.csv",
         "status_path": tmp_path / "status.json",
+        "ember_sample_path": tmp_path / "nonexistent_sample.csv.gz",
         "retry_backoff": 0.01,
         "benign_sources": (("Fake App", "https://example.test/app.exe"),),
         "opener": make_fake_opener({"/app.exe": benign_payload}, []),
@@ -576,3 +577,94 @@ def test_spawn_status_window_non_windows(tmp_path: Path) -> None:
     if sys.platform == "win32":
         pytest.skip("проверяется отказ только на не-Windows")
     assert spawn_status_window(tmp_path / "status.json") is False
+
+
+# --------------------------------------------------------------------------- #
+# Локальная выборка EMBER из репозитория (datasets/ember_2018_sample.csv.gz)
+# --------------------------------------------------------------------------- #
+
+
+def _make_sample_gz(path: Path, n_rows: int) -> Path:
+    """Собирает мини-выборку в формате datasets/ember_2018_sample.csv.gz."""
+    import gzip
+
+    plain = tmp_plain = path.with_suffix(".plain")
+    values = dict.fromkeys(FEATURE_NAMES, 0.25)
+    _append_rows(plain, [
+        (dict(values, entropy_max_section=7.0 + i * 0.001), i % 2,
+         f"e{i:062d}", f"ember:sample{i}")
+        for i in range(n_rows)
+    ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(plain, "rb") as src, gzip.open(path, "wb") as dst:
+        dst.write(src.read())
+    tmp_plain.unlink()
+    return path
+
+
+def test_ember_sample_merged_without_network(tmp_path: Path, benign_exe: Path) -> None:
+    """Выборка из репозитория вливается даже когда сеть недоступна."""
+    sample = _make_sample_gz(tmp_path / "sample.csv.gz", 10)
+
+    def dead_opener(request, timeout=None):  # noqa: ARG001
+        # EMBER-архив недоступен (403), benign-источник работает
+        if request.full_url.endswith(".tar.bz2"):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        return FakeResponse(benign_exe.read_bytes())
+
+    settings = _trainer_settings(
+        tmp_path, benign_exe.read_bytes(),
+        epochs=1, epoch_pause=0.0,
+        ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
+        ember_sample_path=sample,
+        opener=dead_opener,
+    )
+    trainer = NightTrainer(settings)
+    assert trainer.run() == 0
+
+    state = NightState.load(settings.state_path)
+    assert state.ember_sample_done is True
+    assert state.rows_added == 1 + 10       # benign + выборка EMBER
+    dataset = MalwareClassifier().load_dataset_from_csv(settings.csv_path)
+    assert len(dataset) == 11
+
+
+def test_ember_sample_resume_from_offset(tmp_path: Path, benign_exe: Path) -> None:
+    """Прерванное слияние продолжается с сохранённого смещения."""
+    sample = _make_sample_gz(tmp_path / "sample.csv.gz", 10)
+    settings = _trainer_settings(
+        tmp_path, benign_exe.read_bytes(),
+        epochs=1, epoch_pause=0.0, use_ember=True,
+        ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
+        ember_sample_path=sample,
+        opener=make_fake_opener({}, []),  # сеть не понадобится
+    )
+    preset = NightState(path=settings.state_path)
+    preset.benign_done = True
+    preset.ember_sample_merged = 6  # первые 6 строк «уже влиты»
+    preset.save()
+
+    NightTrainer(settings).run()
+    state = NightState.load(settings.state_path)
+    assert state.rows_added == 4            # долились только оставшиеся 4
+    assert state.ember_sample_done is True
+
+
+def test_ember_sample_corrupted_is_skipped(tmp_path: Path, benign_exe: Path) -> None:
+    """Битая/пустая выборка не роняет сессию."""
+    sample = tmp_path / "bad.csv.gz"
+    import gzip
+
+    with gzip.open(sample, "wt", encoding="utf-8") as handle:
+        handle.write("это не csv\n")
+
+    settings = _trainer_settings(
+        tmp_path, benign_exe.read_bytes(),
+        epochs=1, epoch_pause=0.0, use_ember=True,
+        ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
+        ember_sample_path=sample,
+    )
+    assert NightTrainer(settings).run() == 0
+    state = NightState.load(settings.state_path)
+    assert state.ember_sample_done is True  # помечена, больше не мучаем
+    assert state.rows_added == 1            # только benign

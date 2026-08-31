@@ -82,6 +82,12 @@ NIGHTLY_CSV: Path = Path(
     os.environ.get("AIAV_NIGHTLY_CSV", PROJECT_ROOT / "data" / "nightly" / "dataset.csv")
 )
 
+#: Готовая конвертированная выборка EMBER (лежит в репозитории, ~30 МБ):
+#: спасение для регионов, где CDN elastic.co отвечает 403.
+EMBER_SAMPLE_CSV: Path = Path(
+    os.environ.get("AIAV_EMBER_SAMPLE", PROJECT_ROOT / "datasets" / "ember_2018_sample.csv.gz")
+)
+
 #: Живой статус автономной сессии (читает отдельное окно `autolearn-status`).
 NIGHTLY_STATUS: Path = Path(
     os.environ.get("AIAV_NIGHTLY_STATUS", PROJECT_ROOT / "data" / "nightly" / "status.json")
@@ -133,6 +139,7 @@ __all__ = [
     "QUARANTINE_DIR",
     "REPORTS_DIR",
     "DEFAULT_MODEL_FILENAME",
+    "EMBER_SAMPLE_CSV",
     "EMBER_URL",
     "NIGHTLY_CSV",
     "NIGHTLY_STATUS",

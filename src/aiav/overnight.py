@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import bz2  # noqa: F401  (используется tarfile прозрачно)
 import csv
+import gzip
 import json
 import logging
 import subprocess
@@ -53,6 +54,7 @@ from aiav.config import (
     DEFAULT_BACKEND,
     DEFAULT_MODEL_FILENAME,
     DISTILL_PATH,
+    EMBER_SAMPLE_CSV,
     EMBER_URL,
     MALICIOUS_THRESHOLD,
     MODELS_DIR,
@@ -131,6 +133,7 @@ class NightSettings:
     max_rows: int = 0  # 0 — без лимита строк
     use_ember: bool = True
     ember_url: str = EMBER_URL
+    ember_sample_path: Path = EMBER_SAMPLE_CSV
     distill_path: Path = DISTILL_PATH
     downloads_dir: Path = PROJECT_ROOT / "data" / "nightly" / "downloads"
     state_path: Path = PROJECT_ROOT / "data" / "nightly" / "state.json"
@@ -169,6 +172,8 @@ class NightState:
     distill_merged: int = 0        # сколько строк DISTILL уже перенесено
     ember_exhausted: bool = False  # EMBER прочитан целиком
     rows_trained: int = 0          # строк в CSV на момент последней тренировки
+    ember_sample_done: bool = False  # локальная выборка EMBER влита
+    ember_sample_merged: int = 0     # строк локальной выборки уже влито
 
     @classmethod
     def load(cls, path: str | Path) -> NightState:
@@ -186,6 +191,8 @@ class NightState:
                 state.distill_merged = int(raw.get("distill_merged", 0))
                 state.ember_exhausted = bool(raw.get("ember_exhausted", False))
                 state.rows_trained = int(raw.get("rows_trained", 0))
+                state.ember_sample_done = bool(raw.get("ember_sample_done", False))
+                state.ember_sample_merged = int(raw.get("ember_sample_merged", 0))
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("Состояние повреждено (%s) — начинаем с чистого", exc)
         return state
@@ -201,6 +208,8 @@ class NightState:
             "distill_merged": self.distill_merged,
             "ember_exhausted": self.ember_exhausted,
             "rows_trained": self.rows_trained,
+            "ember_sample_done": self.ember_sample_done,
+            "ember_sample_merged": self.ember_sample_merged,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         try:
@@ -719,9 +728,10 @@ class NightTrainer:
         logger.warning("Последняя ошибка: %s", exc)
         logger.warning("Возможные причины и решения:")
         logger.warning("  • HTTP 403/451 — CDN elastic.co блокирует ваш регион.")
-        logger.warning("    Скачайте архив вручную (браузер/другая сеть/VPN):")
-        logger.warning("    %s", self.settings.ember_url)
-        logger.warning("    и положите файл сюда: %s", self.settings.ember_tar_path)
+        logger.warning("    Официальное зеркало (торрент): academictorrents.com,")
+        logger.warning("    раздача 34854ec5114020b33224cedc97fe78731d057df4 (1.7 ГБ).")
+        logger.warning("    Скачанный файл положите сюда: %s", self.settings.ember_tar_path)
+        logger.warning("    (или откройте напрямую: %s)", self.settings.ember_url)
         logger.warning("  • или задайте зеркало: --ember-url <URL> (или AIAV_EMBER_URL)")
         logger.warning("Сессия продолжит работу: benign-источники, метки scan --learn")
         logger.warning("и переобучение накопленных данных.")
@@ -731,9 +741,11 @@ class NightTrainer:
         """Есть ли ещё непрочитанные источники данных?"""
         if not self.state.benign_done:
             return True
-        return bool(self.settings.use_ember
-                    and not self._ember_disabled
-                    and not self.state.ember_exhausted)
+        if not self.settings.use_ember or self._ember_disabled:
+            return False
+        if self.settings.ember_sample_path.is_file() and not self.state.ember_sample_done:
+            return True  # локальная выборка из репозитория ещё не влита
+        return not self.state.ember_exhausted
 
     def _sleep_responsive(self, seconds: float) -> bool:
         """Спит, но следит за дедлайном. False — время вышло."""
@@ -832,8 +844,71 @@ class NightTrainer:
         if added:
             logger.info("Из scan --learn подтянуто новых меток: %d", added)
 
+    def _merge_ember_sample(self) -> bool:
+        """
+        Вливает готовую выборку EMBER из репозитория (без сети!).
+
+        Файл ``datasets/ember_2018_sample.csv.gz`` — заранее конвертированные
+        признаки реальных PE из EMBER 2018 (метки — консенсус VirusTotal).
+        Это основной путь для регионов, где CDN elastic.co блокирует
+        скачивание полного архива (HTTP 403).
+
+        :returns: ``True`` — выборка влита полностью (или отсутствует),
+            можно переходить к полному архиву; ``False`` — прервались
+            по дедлайну/лимиту, продолжим в следующей эпохе.
+        """
+        sample = self.settings.ember_sample_path
+        if not sample.is_file() or self.state.ember_sample_done:
+            return True
+        logger.info("--- ФАЗА 2/2: локальная выборка EMBER (%s) ---", sample.name)
+        self._write_status("EMBER-выборка: слияние")
+
+        merged_now = 0
+        buffer: list[tuple[dict[str, float], int, str, str]] = []
+        try:
+            with gzip.open(sample, "rt", encoding="utf-8", newline="") as handle:
+                reader = csv.reader(handle)
+                header = next(reader, None)
+                if not header or header[:2] != ["path", "sha256"] or header[-1] != "label":
+                    logger.warning("%s: неожиданный формат — пропущен", sample)
+                    self.state.ember_sample_done = True
+                    return True
+                for row_no, row in enumerate(reader):
+                    if row_no < self.state.ember_sample_merged:
+                        continue  # возобновление: уже влитые строки не трогаем
+                    try:
+                        values = dict(zip(
+                            FEATURE_NAMES,
+                            (float(v) for v in row[3:3 + len(FEATURE_NAMES)]),
+                            strict=True))
+                        label = int(row[-1])
+                        sha256 = row[1]
+                    except (ValueError, IndexError):
+                        continue
+                    buffer.append((values, label, sha256, row[0]))
+                    if len(buffer) >= 2_000:
+                        self._flush(buffer)
+                        buffer.clear()
+                        merged_now += 2_000
+                        limit = self.settings.max_rows
+                        if self._time_is_up() or (limit and self.state.rows_added >= limit):
+                            return False
+            if buffer:
+                self._flush(buffer)
+                merged_now += len(buffer)
+        except OSError as exc:
+            logger.error("Не удалось прочитать выборку %s: %s", sample, exc)
+            self.state.ember_sample_done = True  # битый файл не перечитываем бесконечно
+            return True
+
+        self.state.ember_sample_done = True
+        logger.info("Локальная выборка EMBER влита полностью: +%d строк", merged_now)
+        return True
+
     def _phase_ember(self) -> None:
-        """Фаза 2: потоковая конвертация EMBER до дедлайна/лимита."""
+        """Фаза 2: EMBER — сначала локальная выборка, затем полный архив."""
+        if not self._merge_ember_sample():
+            return  # дедлайн/лимит — полный архив подождёт до следующей эпохи
         logger.info("--- ФАЗА 2/2: EMBER (признаки ~1 млн реальных PE) ---")
         self._write_status("EMBER: скачивание/чтение архива")
         stream = EmberStream(self.settings, self.state)
