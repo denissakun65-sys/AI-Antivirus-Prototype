@@ -665,8 +665,10 @@ class NightTrainer:
                 if self._time_is_up():
                     break
 
-                if collection_failed:
+                if collection_failed and self._collection_incomplete():
                     # БЭКОФФ: не долбим источник ошибками — ждём всё дольше.
+                    # (Если источник только что отключён — ждать незачем,
+                    #  повторять нечего: следующая эпоха пойдёт сразу.)
                     pause = settings.retry_backoff * self._consecutive_failures
                     logger.warning("Пауза %.0f c перед повтором (ошибок подряд: %d)",
                                    pause, self._consecutive_failures)
