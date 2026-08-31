@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        run: ruff check src tests tools
+
+      - name: Pytest
+        run: pytest -v --cov=src/aiav --cov-report=term-missing
+
+      # Смоук-тест CLI: обучение на синтетических образцах и скан в dry-run.
+      - name: CLI smoke test
+        run: |
+          python tools/generate_samples.py --out data/samples --per-class 20
+          python main.py train --dataset data/samples --backend random_forest
+          python main.py model-info
+          python main.py features data/samples/malware/malware_sample_0000.exe | head -20
+          python main.py scan data/samples --dry-run --limit 5 || true
+
+  security-scan:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Run pip-audit
+        # Прототип: уязвимости зависимостей фиксируем, но сборку не ломаем.
+        run: pip-audit -r requirements.txt --strict || true
