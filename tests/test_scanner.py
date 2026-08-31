@@ -232,3 +232,179 @@ def test_max_file_size_skips_large_files(
     paths = {r.path for r in summary.results}
     assert any("small.exe" in p for p in paths)
     assert not any("oversized.exe" in p for p in paths)
+
+
+# --------------------------------------------------------------------------- #
+# Кэш, whitelist, онлайн-репутация и обучение на консенсусе
+# --------------------------------------------------------------------------- #
+
+import urllib.error  # noqa: E402
+
+from aiav.cache import VerdictCache  # noqa: E402
+from aiav.threat_intel import (  # noqa: E402
+    MALWAREBAZAAR_URL,
+    VIRUSTOTAL_URL,
+    ThreatIntelClient,
+)
+from aiav.trustlist import Trustlist  # noqa: E402
+
+
+def _vt_clean_transport():
+    def transport(url, method, headers, data, timeout):  # noqa: ARG001
+        if url.startswith(MALWAREBAZAAR_URL):
+            return {"query_status": "hash_not_found"}
+        if url.startswith(VIRUSTOTAL_URL):
+            return {"data": {"attributes": {"last_analysis_stats": {
+                "malicious": 0, "suspicious": 0, "harmless": 42}}}}
+        raise urllib.error.URLError("unexpected")
+
+    return transport
+
+
+def _vt_malicious_transport():
+    def transport(url, method, headers, data, timeout):  # noqa: ARG001
+        if url.startswith(MALWAREBAZAAR_URL):
+            return {"query_status": "ok", "data": [{"signature": "Test.Fake"}]}
+        raise urllib.error.URLError("unexpected")
+
+    return transport
+
+
+def test_cache_verdict_reused_without_model_call(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, malicious_exe: Path
+) -> None:
+    """Второй прогон того же файла отдаёт вердикт из кэша (source='cache')."""
+    cache = VerdictCache(":memory:")
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report", cache=cache
+    )
+    first = scanner.scan_file(malicious_exe)
+    assert first.source == "model" and first.verdict == Verdict.MALICIOUS.value
+
+    second = scanner.scan_file(malicious_exe)
+    assert second.source == "cache"
+    assert second.verdict == Verdict.MALICIOUS.value
+    assert cache.counts()["verdicts"] == 1
+
+
+def test_trusted_hash_forced_clean(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, malicious_exe: Path
+) -> None:
+    """Файл в whitelist не flagged даже если модель кричит MALICIOUS."""
+    trustlist = Trustlist(path=tmp_path / "t.json", trusted_prefixes=())
+    trustlist.trust_file(malicious_exe)
+
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="quarantine",
+        trustlist=trustlist,
+    )
+    result = scanner.scan_file(malicious_exe)
+    assert result.source == "trustlist"
+    assert result.verdict == Verdict.CLEAN.value
+    assert not result.quarantined          # доверие сильнее модели
+    assert malicious_exe.exists()          # файл не тронут
+
+
+def test_trusted_path_prefix_skips_in_directory_scan(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, benign_exe: Path
+) -> None:
+    """Целый доверенный каталог не сканируется (trusted_skipped)."""
+    trusted_dir = tmp_path / "games"
+    trusted_dir.mkdir()
+    (trusted_dir / "launcher.exe").write_bytes(benign_exe.read_bytes())
+
+    outside = tmp_path / "outside.exe"
+    outside.write_bytes(benign_exe.read_bytes())
+
+    trustlist = Trustlist(path=tmp_path / "t.json", trusted_prefixes=(str(trusted_dir),))
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report",
+        trustlist=trustlist,
+    )
+    summary = scanner.scan_paths([tmp_path])
+    assert summary.trusted_skipped == 1
+    assert summary.scanned == 1            # разобрался только внешний файл
+
+
+def test_online_escalation_to_malicious(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, malicious_exe: Path
+) -> None:
+    """Серая зона + репутация «известный malware» => эскалация до MALICIOUS."""
+    intel = ThreatIntelClient(vt_api_key="k", transport=_vt_malicious_transport())
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report",
+        intel=intel, online=True,
+        malicious_threshold=1.01,          # модель даёт SUSPICIOUS, не MALICIOUS
+        suspicious_threshold=0.5,
+    )
+    summary = scanner.scan_paths([malicious_exe])
+    assert summary.intel_checked == 1
+    assert summary.intel_malicious == 1
+    assert summary.malicious == 1          # эскалировано
+
+
+def test_online_demotion_reduces_false_positive(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, benign_exe: Path
+) -> None:
+    """Серая зона + «40 движков считают чистым» => подозрение снято (анти-ложняк)."""
+    intel = ThreatIntelClient(vt_api_key="k", transport=_vt_clean_transport())
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report",
+        intel=intel, online=True,
+        malicious_threshold=1.01,
+        suspicious_threshold=0.0,          # даже чистый файл попадает в «серую зону»
+    )
+    summary = scanner.scan_paths([benign_exe])
+    assert summary.intel_checked == 1
+    assert summary.intel_clean == 1
+    assert summary.suspicious == 0
+    assert summary.clean == 1
+
+
+def test_learn_mode_writes_consensus_labels(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path,
+    malicious_exe: Path, benign_exe: Path,
+) -> None:
+    """--learn: пары «признаки + консенсус движков» складываются в CSV."""
+    import csv as csv_module
+
+    distill = tmp_path / "distill.csv"
+
+    # Для malicious: MB говорит «известный malware» -> label=1.
+    # Для benign: порог suspicious=0.0 загоняет в серую зону, VT говорит clean -> label=0.
+    from aiav.features import sha256_of
+
+    malicious_sha = sha256_of(malicious_exe)
+
+    class SwitchingTransport:
+        """По хешу злодея MB говорит «известный malware», по чистому — VT «clean»."""
+
+        def __call__(self, url, method, headers, data, timeout):  # noqa: ARG002
+            if url.startswith(MALWAREBAZAAR_URL):
+                if malicious_sha in (data or b"").decode():
+                    return {"query_status": "ok", "data": [{"signature": "Test.Fake"}]}
+                return {"query_status": "hash_not_found"}
+            if url.startswith(VIRUSTOTAL_URL):
+                return {"data": {"attributes": {"last_analysis_stats": {
+                    "malicious": 0, "suspicious": 0, "harmless": 42}}}}
+            raise urllib.error.URLError("unexpected")
+
+    intel = ThreatIntelClient(vt_api_key="k", transport=SwitchingTransport())
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report",
+        intel=intel, online=True, learn_path=distill,
+        malicious_threshold=1.01, suspicious_threshold=0.0,
+    )
+    summary = scanner.scan_paths([malicious_exe, benign_exe])
+
+    assert summary.labels_collected == 2
+    with open(distill, newline="", encoding="utf-8") as handle:
+        rows = list(csv_module.DictReader(handle))
+    labels = sorted(int(r["label"]) for r in rows)
+    assert labels == [0, 1]
+    assert len(rows[0]) == 3 + 46 + 1       # служебные + признаки + метка
+
+    # CSV сразу пригоден для переобучения существующим train --csv.
+    learner = MalwareClassifier(backend="random_forest")
+    dataset = learner.load_dataset_from_csv(distill)
+    assert len(dataset) == 2

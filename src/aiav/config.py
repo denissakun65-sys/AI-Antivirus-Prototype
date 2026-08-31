@@ -31,6 +31,44 @@ REPORTS_DIR: Path = Path(os.environ.get("AIAV_REPORTS_DIR", PROJECT_ROOT / "repo
 #: Имя файла модели по умолчанию
 DEFAULT_MODEL_FILENAME: str = "malware_classifier.joblib"
 
+#: SQLite-кэш вердиктов (sha256 + сигнатура модели -> вердикт).
+VERDICT_CACHE_PATH: Path = Path(
+    os.environ.get("AIAV_CACHE_DB", MODELS_DIR / "verdict_cache.db")
+)
+
+#: JSON со списками доверия (хеши + пути).
+TRUSTLIST_PATH: Path = Path(
+    os.environ.get("AIAV_TRUSTLIST", MODELS_DIR / "trustlist.json")
+)
+
+#: Ключ VirusTotal API (если задан — онлайн-репутация богаче).
+VIRUSTOTAL_API_KEY: str = os.environ.get("AIAV_VT_KEY", "")
+
+#: Пути, которые считаем заведомо доверенными и не сканируем.
+#: Переопределяется env-переменной AIAV_TRUSTED_PREFIXES (разделитель — os.pathsep).
+if os.name == "nt":  # pragma: no cover - зависит от ОС
+    _DEFAULT_TRUSTED_PREFIXES = (
+        "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+    )
+else:
+    _DEFAULT_TRUSTED_PREFIXES = ("/usr/lib", "/usr/share", "/lib", "/lib64", "/bin", "/sbin")
+
+_env_prefixes = os.environ.get("AIAV_TRUSTED_PREFIXES", "")
+TRUSTED_PATH_PREFIXES: tuple[str, ...] = (
+    tuple(p for p in _env_prefixes.split(os.pathsep) if p)
+    if _env_prefixes
+    else _DEFAULT_TRUSTED_PREFIXES
+)
+
+#: TTL для кэша репутационных ответов (дни): репутация со временем меняется.
+INTEL_CACHE_TTL_DAYS: int = int(os.environ.get("AIAV_INTEL_TTL_DAYS", 7))
+
+#: CSV, куда ``scan --learn`` складывает пары «признаки -> вердикт консенсуса
+#: мировых движков» для последующего переобучения локальной модели.
+DISTILL_PATH: Path = Path(
+    os.environ.get("AIAV_DISTILL_CSV", PROJECT_ROOT / "data" / "distill" / "dataset.csv")
+)
+
 # --------------------------------------------------------------------------- #
 # Пороги принятия решений
 # --------------------------------------------------------------------------- #
@@ -67,6 +105,12 @@ RANDOM_STATE: int = 42
 
 __all__ = [
     "PROJECT_ROOT",
+    "VERDICT_CACHE_PATH",
+    "TRUSTLIST_PATH",
+    "VIRUSTOTAL_API_KEY",
+    "TRUSTED_PATH_PREFIXES",
+    "INTEL_CACHE_TTL_DAYS",
+    "DISTILL_PATH",
     "MODELS_DIR",
     "QUARANTINE_DIR",
     "REPORTS_DIR",

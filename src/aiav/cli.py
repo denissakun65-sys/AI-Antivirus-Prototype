@@ -35,9 +35,11 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from aiav import __version__  # noqa: E402
+from aiav.cache import VerdictCache  # noqa: E402
 from aiav.config import (  # noqa: E402
     DEFAULT_BACKEND,
     DEFAULT_MODEL_FILENAME,
+    DISTILL_PATH,
     MALICIOUS_THRESHOLD,
     MAX_FILE_SIZE_BYTES,
     MODELS_DIR,
@@ -54,6 +56,8 @@ from aiav.logging_setup import get_logger, setup_logging  # noqa: E402
 from aiav.model import MalwareClassifier  # noqa: E402
 from aiav.quarantine import QuarantineError, QuarantineManager  # noqa: E402
 from aiav.scanner import FileScanner, ScanSummary  # noqa: E402
+from aiav.threat_intel import ThreatIntelClient  # noqa: E402
+from aiav.trustlist import Trustlist  # noqa: E402
 
 logger = get_logger("main")
 
@@ -139,6 +143,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             logger.error("Карантин недоступен: %s", exc)
             return 2
 
+    if args.learn:
+        args.online = True
+    cache = None if args.no_cache else VerdictCache()
+    trustlist = Trustlist()
+    intel = ThreatIntelClient(cache=cache) if args.online else None
+    if args.online:
+        logger.info("Онлайн-репутация включена (MalwareBazaar%s)",
+                    " + VirusTotal" if intel and intel.vt_api_key else "")
+    learn_path = DISTILL_PATH if args.learn else None
+
     scanner = FileScanner(
         classifier,
         quarantine,
@@ -147,6 +161,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         malicious_threshold=args.malicious_threshold,
         dry_run=args.dry_run,
         model_path=model_path,
+        cache=cache,
+        trustlist=trustlist,
+        intel=intel,
+        online=args.online,
+        learn_path=learn_path,
         max_file_size=(
             int(args.max_file_size * 1024 * 1024)
             if args.max_file_size is not None
@@ -168,6 +187,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     if not args.no_report:
         scanner.save_report(summary, args.report_dir, include_features=args.full_report)
+
+    if args.learn and summary.labels_collected:
+        print(
+            f"\nСобрано обучающих пар (консенсус движков): {summary.labels_collected}. "
+            f"Переобучение: python main.py train --csv {DISTILL_PATH}"
+        )
 
     # Код возврата в стиле антивирусов: 0 — чисто, 1 — найдены угрозы, 2 — ошибка.
     return 1 if summary.malicious or summary.suspicious else 0
@@ -299,6 +324,105 @@ def cmd_quarantine(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_trust(args: argparse.Namespace) -> int:
+    """Подкоманда ``trust``: управление whitelist (борьба с ложными срабатываниями)."""
+    try:
+        trustlist = Trustlist()
+    except OSError as exc:
+        logger.error("Trustlist недоступен: %s", exc)
+        return 2
+
+    if args.taction == "list":
+        data = trustlist.dump()
+        print("Доверенные хеши:")
+        for digest in data["hashes"]:
+            print(f"  {digest}")
+        print("Доверенные пути:")
+        for prefix in data["paths"]:
+            print(f"  {prefix}")
+        stats = trustlist.stats()
+        print(f"\nВсего: {stats['hashes']} хеш(ей), {stats['paths']} путь(ей)")
+        return 0
+
+    if args.taction == "add":
+        if not args.paths:
+            logger.error("Укажите файлы: trust add <file> [file …]")
+            return 2
+        for target in args.paths:
+            path = Path(target).expanduser()
+            if not path.is_file():
+                logger.error("Не файл: %s", path)
+                return 2
+            digest = trustlist.trust_file(path)
+            print(f"Доверено: {path.name} ({digest[:16]}…)")
+        return 0
+
+    if args.taction == "add-path":
+        if not args.paths:
+            logger.error("Укажите каталог: trust add-path <dir>")
+            return 2
+        for target in args.paths:
+            trustlist.trust_path_prefix(str(Path(target).expanduser().resolve()))
+            print(f"Доверенный префикс: {target}")
+        return 0
+
+    if args.taction == "remove":
+        if not args.paths:
+            logger.error("Укажите хеш или путь: trust remove <token>")
+            return 2
+        removed = 0
+        for token in args.paths:
+            removed += int(trustlist.untrust(token))
+        print(f"Удалено записей: {removed}")
+        return 0 if removed else 1
+
+    logger.error("Неизвестное действие trust: %s", args.taction)
+    return 2
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Подкоманда ``monitor``: фоновое наблюдение за каталогами."""
+    from aiav.monitor import run_monitor
+
+    model_path = Path(args.model).expanduser()
+    try:
+        classifier = MalwareClassifier.load(model_path)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 2
+
+    quarantine: QuarantineManager | None = None
+    if args.action == "quarantine":
+        try:
+            quarantine = QuarantineManager(args.quarantine_dir, encrypt=not args.no_encrypt)
+        except QuarantineError as exc:
+            logger.error("Карантин недоступен: %s", exc)
+            return 2
+
+    cache = VerdictCache()
+    trustlist = Trustlist()
+    intel = ThreatIntelClient(cache=cache) if args.online else None
+    scanner = FileScanner(
+        classifier,
+        quarantine,
+        action=args.action,
+        cache=cache,
+        trustlist=trustlist,
+        intel=intel,
+        online=args.online,
+        model_path=model_path,
+    )
+    try:
+        return run_monitor(
+            [Path(t).expanduser().resolve() for t in args.targets],
+            scanner,
+            recursive=not args.no_recursive,
+        )
+    except ImportError as exc:
+        logger.error("%s", exc)
+        return 2
+
+
 def cmd_model_info(args: argparse.Namespace) -> int:
     """Подкоманда ``model-info``: сведения о сохранённой модели."""
     try:
@@ -370,6 +494,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="сколько строк таблицы выводить в консоль")
     scan.add_argument("--lenient", action="store_true",
                       help="не падать при несовпадении схемы признаков модели")
+    scan.add_argument("--online", action="store_true",
+                      help="консультироваться с онлайн-репутацией по «серой зоне» "
+                           "(MalwareBazaar; + VirusTotal при AIAV_VT_KEY)")
+    scan.add_argument("--learn", action="store_true",
+                      help="учиться на консенсусе мировых движков: складывать пары "
+                           "«признаки -> вердикт движков» в CSV для переобучения "
+                           "(включает --online)")
+    scan.add_argument("--no-cache", action="store_true",
+                      help="не использовать кэш вердиктов (принудительно разбирать всё)")
     scan.add_argument("--max-file-size", type=float, default=None, metavar="MB",
                       help=f"лимит размера разбираемого файла в МБ "
                            f"(по умолчанию {MAX_FILE_SIZE_BYTES // (1024 * 1024)}; "
@@ -412,6 +545,33 @@ def build_parser() -> argparse.ArgumentParser:
     quar.add_argument("--quarantine-dir", default=str(QUARANTINE_DIR), help="каталог карантина")
     quar.add_argument("--no-encrypt", action="store_true", help="объекты не зашифрованы")
     quar.set_defaults(handler=cmd_quarantine)
+
+    # --- trust ---
+    trust = subparsers.add_parser("trust", help="управление списком доверия")
+    _add_common_flags(trust)
+    trust.add_argument("taction", choices=("add", "add-path", "remove", "list"),
+                       help="действие")
+    trust.add_argument("paths", nargs="*", default=[],
+                       help="файлы (add), префикс каталога (add-path) или хеш/путь (remove)")
+    trust.set_defaults(handler=cmd_trust)
+
+    # --- monitor ---
+    monitor = subparsers.add_parser(
+        "monitor", help="фоновое наблюдение за каталогами (нужен пакет watchdog)")
+    _add_common_flags(monitor)
+    monitor.add_argument("targets", nargs="+", help="каталоги для наблюдения")
+    monitor.add_argument("--model", default=str(MODELS_DIR / DEFAULT_MODEL_FILENAME),
+                         help="путь к обученной модели (.joblib)")
+    monitor.add_argument("--action", choices=("quarantine", "report"), default="quarantine",
+                         help="действие при обнаружении угрозы")
+    monitor.add_argument("--quarantine-dir", default=str(QUARANTINE_DIR))
+    monitor.add_argument("--no-recursive", action="store_true",
+                         help="не наблюдать подкаталоги")
+    monitor.add_argument("--online", action="store_true",
+                         help="онлайн-репутация для «серой зоны»")
+    monitor.add_argument("--no-encrypt", action="store_true",
+                         help="хранить объекты карантина без шифрования")
+    monitor.set_defaults(handler=cmd_monitor)
 
     # --- model-info ---
     info = subparsers.add_parser("model-info", help="сведения о модели")
