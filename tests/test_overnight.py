@@ -16,6 +16,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from aiav.features import FEATURE_NAMES
@@ -409,42 +410,80 @@ def test_trainer_two_epochs_end_to_end(tmp_path: Path, benign_exe: Path) -> None
     assert after.retrains == retrains_before
 
 
-def test_trainer_never_degrades_existing_model(tmp_path: Path, benign_exe: Path) -> None:
-    """Если текущая модель лучше — она НЕ перезаписывается."""
-    settings = _trainer_settings(tmp_path, benign_exe.read_bytes(), epochs=1)
+def test_synthetic_model_loses_to_real_data(tmp_path: Path, benign_exe: Path) -> None:
+    """
+    Синтетическая модель с CV-F1=1.0 уступает реальной, обученной на EMBER.
 
-    # «сильная» текущая модель с завышенным CV-F1
-    strong = MalwareClassifier()
-    _append_rows(settings.csv_path, [
-        ({n: float(i % 7) for n in FEATURE_NAMES}, i % 2, f"s{i:062d}", "strong")
-        for i in range(40)
-    ])
-    strong.fit(strong.load_dataset_from_csv(settings.csv_path))
-    strong.metrics.cv_f1_mean = 0.9999
-    strong.save(settings.model_path)
+    Раньше сравнение шло по CV-F1 разных датасетов — синтетика «побеждала»
+    вечно. Теперь судья один: общая отложенная выборка из ночного CSV.
+    """
+    # Текущая «боевая» модель: обучена на игрушечных данных с ПЕРЕВЁРНУТЫМ
+    # правилом (низкая энтропия = malware). На синтетике у неё CV-F1 = 1.0.
+    toy_csv = tmp_path / "toy.csv"
+    toy_rows = []
+    for i in range(60):
+        label = i % 2
+        values = dict.fromkeys(FEATURE_NAMES, 0.1)
+        values["entropy_max_section"] = 3.0 if label else 7.5  # перевёрнутое правило
+        toy_rows.append((values, label, f"t{i:062d}", "toy"))
+    _append_rows(toy_csv, toy_rows)
+    toy = MalwareClassifier()
+    toy.fit(toy.load_dataset_from_csv(toy_csv))
+    toy.metrics.cv_f1_mean = 1.0  # «идеальная» на синтетике
+    settings = _trainer_settings(tmp_path, benign_exe.read_bytes(), epochs=1)
+    toy.save(settings.model_path)
     digest_before = hashlib.sha256(settings.model_path.read_bytes()).hexdigest()
 
-    # шумовой датасет: метки случайны — CV-F1 заведомо хуже 0.9999
-    noise_csv = tmp_path / "noise.csv"
-    _append_rows(noise_csv, [
-        ({n: float((i * 7 + j) % 13) for n, j in zip(FEATURE_NAMES, range(46), strict=True)},
-         (i * 31) % 2, f"n{i:062d}", "noise")
-        for i in range(60)
-    ])
-    settings_noisy = _trainer_settings(tmp_path, benign_exe.read_bytes(),
-                                       epochs=1, csv_path=noise_csv,
-                                       model_path=settings.model_path,
-                                       use_ember=False, benign_sources=(),
-                                       state_path=tmp_path / "noisy_state.json")
-    # состояние: 60 строк собрано, но ещё не обучено — финальный дообуч запустится
-    preset = NightState(path=settings_noisy.state_path)
-    preset.rows_added = 60
+    # Ночной CSV: настоящие EMBER-подобные данные (malware = высокая энтропия).
+    # Кандидат выучит правильное правило и на общих тестах разгромит игрушку.
+    records = [ember_record(i, label=i % 2) for i in range(120)]
+    real_rows = []
+    for rec in records:
+        values = ember_record_to_features(rec)
+        real_rows.append((values, rec["label"], rec["sha256"], "ember"))
+    real_csv = tmp_path / "real.csv"
+    _append_rows(real_csv, real_rows)
+
+    settings_real = _trainer_settings(tmp_path, benign_exe.read_bytes(),
+                                      epochs=1, csv_path=real_csv,
+                                      model_path=settings.model_path,
+                                      use_ember=False, benign_sources=(),
+                                      state_path=tmp_path / "real_state.json")
+    preset = NightState(path=settings_real.state_path)
+    preset.rows_added = 120
     preset.benign_done = True
     preset.save()
-    NightTrainer(settings_noisy).run()
+    NightTrainer(settings_real).run()
 
     digest_after = hashlib.sha256(settings.model_path.read_bytes()).hexdigest()
-    assert digest_after == digest_before     # лучшая модель уцелела
+    assert digest_after != digest_before     # реальная модель заменила синтетику
+    bundle = ModelBundle.load(settings.model_path)
+    assert bundle.metrics.f1 > 0.85          # и она действительно хороша
+
+
+def test_fair_f1_same_holdout(tmp_path: Path) -> None:
+    """_fair_f1: своя распределение -> ~1.0, чужое (перевёрнутое) -> заметно ниже."""
+    csv_path = tmp_path / "sep.csv"
+    rows = []
+    for i in range(80):
+        label = i % 2
+        values = dict.fromkeys(FEATURE_NAMES, 0.1)
+        values["entropy_max_section"] = 7.5 if label else 2.5
+        rows.append((values, label, f"f{i:062d}", "sep"))
+    _append_rows(csv_path, rows)
+    clf = MalwareClassifier()
+    dataset = clf.load_dataset_from_csv(csv_path)
+    clf.fit(dataset)
+    clf.save(tmp_path / "sep.joblib")
+    bundle = ModelBundle.load(tmp_path / "sep.joblib")
+
+    x = dataset[list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
+    y = dataset["label"].to_numpy(dtype=int)
+
+    f1_own = NightTrainer._fair_f1(bundle, x, y)            # noqa: SLF009
+    f1_flipped = NightTrainer._fair_f1(bundle, x, 1 - y)    # noqa: SLF009
+    assert f1_own is not None and f1_own > 0.95
+    assert f1_flipped is not None and f1_flipped < 0.1
 
 
 def test_trainer_respects_past_deadline(tmp_path: Path, benign_exe: Path) -> None:

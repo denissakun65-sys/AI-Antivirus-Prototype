@@ -50,6 +50,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from aiav.config import (
     DEFAULT_BACKEND,
     DEFAULT_MODEL_FILENAME,
@@ -62,6 +64,7 @@ from aiav.config import (
     NIGHTLY_STATUS,
     PROJECT_ROOT,
     RANDOM_STATE,
+    TEST_SIZE,
 )
 from aiav.features import (
     _API_GROUPS,
@@ -72,7 +75,7 @@ from aiav.features import (
     is_pe_file,
     sha256_of,
 )
-from aiav.model import MalwareClassifier, ModelBundle
+from aiav.model import LABEL_COLUMN, MalwareClassifier, ModelBundle
 
 logger = logging.getLogger("aiav.overnight")
 
@@ -986,20 +989,47 @@ class NightTrainer:
             return
 
         self.state.rows_trained = self.state.rows_added
-        current_cv = self._current_cv_f1()
-        improved = current_cv is None or metrics.cv_f1_mean > current_cv + 1e-6
+
+        # --- Честное сравнение: кандидат и текущая модель на одном holdout ---
+        improved = True
+        try:
+            current_bundle = ModelBundle.load(self.settings.model_path,
+                                              strict_features=False)
+        except (FileNotFoundError, ValueError):
+            current_bundle = None
+
+        if current_bundle is not None:
+            from sklearn.model_selection import train_test_split  # локальный импорт
+
+            x = dataset[list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
+            y = dataset[LABEL_COLUMN].to_numpy(dtype=int)
+            stratify = y if min(np.bincount(y)[np.bincount(y) > 0]) >= 2 else None
+            _, x_test, _, y_test = train_test_split(
+                x, y, test_size=TEST_SIZE,
+                random_state=classifier.random_state, stratify=stratify,
+            )
+            old_f1 = self._fair_f1(current_bundle, x_test, y_test)
+            if old_f1 is None:
+                logger.warning("Текущую модель не удалось оценить на общих данных "
+                               "— сравниваю по CV-F1")
+                improved = metrics.cv_f1_mean > current_bundle.metrics.cv_f1_mean + 1e-6
+            else:
+                improved = metrics.f1 > old_f1 + 0.005
+                logger.info("Честное сравнение на %d общих тестовых строках: "
+                            "кандидат F1=%.4f vs текущая модель F1=%.4f",
+                            len(y_test), metrics.f1, old_f1)
+
         if improved:
             try:
                 classifier.save(self.settings.model_path)
                 self._best_cv = metrics.cv_f1_mean
-                logger.info("Модель УЛУЧШЕНА: CV-F1 %.4f -> %.4f (сохранена)",
-                            current_cv if current_cv is not None else 0.0,
-                            metrics.cv_f1_mean)
+                logger.info("Модель УЛУЧШЕНА и сохранена (F1=%.4f, CV-F1=%.4f)",
+                            metrics.f1, metrics.cv_f1_mean)
             except OSError as exc:
                 logger.error("Не удалось сохранить модель: %s", exc)
         else:
-            logger.info("Модель оставлена прежней: новый CV-F1 %.4f <= текущий %.4f",
-                        metrics.cv_f1_mean, current_cv if current_cv is not None else 0.0)
+            logger.info("Модель оставлена прежней: кандидат не превзошёл текущую "
+                        "на общих тестовых данных")
         self.state.retrains += 1
         self.state.save()
 
@@ -1009,6 +1039,25 @@ class NightTrainer:
         except (FileNotFoundError, ValueError):
             return None
         return float(bundle.metrics.cv_f1_mean)
+
+    @staticmethod
+    def _fair_f1(bundle: ModelBundle, x_test, y_test) -> float | None:
+        """
+        F1 текущей модели НА ТОЙ ЖЕ отложенной выборке, что и у кандидата.
+
+        Сравнивать CV-F1 моделей, обученных на разных датасетах, бессмысленно
+        (синтетика даёт 1.0 и вечно «побеждает» реальные 0.92). Честный судья —
+        общие тестовые данные: на них синтетическая модель проваливается,
+        и реальная модель занимает её место.
+        """
+        try:
+            from sklearn.metrics import f1_score  # локально: нужен только здесь
+
+            preds = bundle.pipeline.predict(x_test)
+            return float(f1_score(y_test, preds))
+        except Exception as exc:  # noqa: BLE001 — оценка не должна ронять сессию
+            logger.debug("Не удалось честно оценить текущую модель: %s", exc)
+            return None
 
     # -- служебное ----------------------------------------------------------- #
 
