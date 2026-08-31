@@ -44,6 +44,7 @@ from aiav.config import (  # noqa: E402
     MAX_FILE_SIZE_BYTES,
     MODELS_DIR,
     NIGHTLY_CSV,
+    NIGHTLY_STATUS,
     QUARANTINE_DIR,
     REPORTS_DIR,
     SUSPICIOUS_THRESHOLD,
@@ -396,7 +397,42 @@ def cmd_autolearn(args: argparse.Namespace) -> int:
         retrain_every=args.retrain_every,
         max_rows=args.max_rows,
         use_ember=not args.no_ember,
+        ember_url=args.ember_url,
+        status_window=not args.no_status_window,
     )
+
+
+def cmd_autolearn_status(args: argparse.Namespace) -> int:
+    """Подкоманда ``autolearn-status``: доска статуса (однократно или --watch)."""
+    import os
+    import sys
+    import time
+
+    from aiav.overnight import read_status, render_status
+
+    status_path = Path(args.status).expanduser()
+
+    if not args.watch:
+        status = read_status(status_path)
+        if status is None:
+            logger.error("Статус не найден: %s — сначала запустите autolearn", status_path)
+            return 2
+        print(render_status(status))
+        return 0
+
+    if sys.platform == "win32":
+        os.system("")  # включает ANSI-последовательности в консоли Windows
+    try:
+        while True:
+            status = read_status(status_path)
+            board = render_status(status) if status else (
+                f"Ожидание статуса: {status_path}\n(запустите python main.py autolearn)"
+            )
+            sys.stdout.write("\x1b[2J\x1b[H" + board + "\n")
+            sys.stdout.flush()
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_monitor(args: argparse.Namespace) -> int:
@@ -618,7 +654,23 @@ def build_parser() -> argparse.ArgumentParser:
                            help="предел строк данных (0 = без лимита, по умолчанию)")
     autolearn.add_argument("--no-ember", action="store_true",
                            help="не скачивать EMBER (только benign-бинарники)")
+    autolearn.add_argument("--ember-url", default=None, metavar="URL_ИЛИ_ПУТЬ",
+                           help="зеркало EMBER или путь к скачанному вручную архиву "
+                                "(при HTTP 403 — регион заблокирован CDN)")
+    autolearn.add_argument("--no-status-window", action="store_true",
+                           help="не открывать отдельное окно со статусом (Windows)")
     autolearn.set_defaults(handler=cmd_autolearn)
+
+    astatus = subparsers.add_parser(
+        "autolearn-status",
+        help="живой статус сессии autolearn (время, эпохи, строки)",
+    )
+    _add_common_flags(astatus)
+    astatus.add_argument("--status", default=str(NIGHTLY_STATUS),
+                         help="путь к status.json (по умолчанию data/nightly/status.json)")
+    astatus.add_argument("--watch", action="store_true",
+                         help="обновлять доску каждую секунду (режим отдельного окна)")
+    astatus.set_defaults(handler=cmd_autolearn_status)
 
     # --- model-info ---
     info = subparsers.add_parser("model-info", help="сведения о модели")

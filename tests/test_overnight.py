@@ -31,6 +31,10 @@ from aiav.overnight import (
     compute_deadline,
     download_file,
     ember_record_to_features,
+    fmt_hms,
+    read_status,
+    render_status,
+    spawn_status_window,
 )
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +120,7 @@ def make_ember_tar(path: Path, records: list[dict],
         info = tarfile.TarInfo(member)
         info.size = len(payload)
         archive.addfile(info, io.BytesIO(payload))
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(bz2.compress(raw.getvalue()))
     return path
 
@@ -351,6 +356,8 @@ def _trainer_settings(tmp_path: Path, benign_payload: bytes, **overrides) -> Nig
         "state_path": tmp_path / "state.json",
         "ember_tar_path": tar_path,
         "distill_path": tmp_path / "distill.csv",
+        "status_path": tmp_path / "status.json",
+        "retry_backoff": 0.01,
         "benign_sources": (("Fake App", "https://example.test/app.exe"),),
         "opener": make_fake_opener({"/app.exe": benign_payload}, []),
     }
@@ -440,3 +447,96 @@ def test_trainer_respects_past_deadline(tmp_path: Path, benign_exe: Path) -> Non
     state = NightState.load(settings.state_path)
     assert state.epochs == 0
     assert not settings.model_path.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Живой статус, бэкофф и локальный EMBER-архив
+# --------------------------------------------------------------------------- #
+
+
+def test_status_file_written_by_trainer(tmp_path: Path, benign_exe: Path) -> None:
+    settings = _trainer_settings(tmp_path, benign_exe.read_bytes(), epochs=1)
+    NightTrainer(settings).run()
+
+    status = read_status(settings.status_path)
+    assert status is not None
+    assert status["running"] is False          # сессия завершилась
+    assert status["epochs"] >= 1
+    assert status["rows_added"] >= 121
+    assert status["phase"] == "остановлено"
+    assert status["elapsed_sec"] >= 0
+
+
+def test_render_status_board() -> None:
+    board = render_status({
+        "running": True, "elapsed_sec": 3725, "epochs": 42,
+        "rows_added": 1234, "retrains": 3, "phase": "EMBER: сбор",
+        "cv_f1": 0.9812, "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    assert "01:02:05" in board          # 3725 c -> ЧЧ:ММ:СС
+    assert "Эпох пройдено  : 42" in board
+    assert "РАБОТАЕТ" in board
+    assert "0.9812" in board
+
+
+def test_fmt_hms() -> None:
+    assert fmt_hms(0) == "00:00:00"
+    assert fmt_hms(59) == "00:00:59"
+    assert fmt_hms(3600) == "01:00:00"
+    assert fmt_hms(-5) == "00:00:00"    # защита от отрицательных
+
+
+def test_read_status_missing_returns_none(tmp_path: Path) -> None:
+    assert read_status(tmp_path / "nope.json") is None
+
+
+def test_backoff_and_ember_autodisable(tmp_path: Path, benign_exe: Path) -> None:
+    """EMBER недоступен: бэкофф + автоотключение вместо бесконечных ошибок."""
+    seen: list = []
+
+    def failing_opener(request, timeout=None):  # noqa: ARG001
+        seen.append(request.full_url)
+        if request.full_url.endswith(".tar.bz2"):
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "Forbidden", {}, None)
+        return FakeResponse(benign_exe.read_bytes())
+
+    settings = _trainer_settings(
+        tmp_path, benign_exe.read_bytes(),
+        epochs=4, epoch_pause=0.0,
+        ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
+        ember_fail_limit=2,
+        opener=failing_opener,
+    )
+    trainer = NightTrainer(settings)
+    assert trainer.run() == 0
+
+    ember_attempts = [u for u in seen if u.endswith(".tar.bz2")]
+    assert len(ember_attempts) == 2      # после 2 ошибок подряд — отключён
+    assert trainer._ember_disabled is True  # noqa: SLF001
+    state = NightState.load(settings.state_path)
+    assert state.epochs == 4             # сессия дошла до конца без EMBER
+
+
+def test_ember_stream_accepts_local_archive(tmp_path: Path) -> None:
+    """--ember-url может быть путём к вручную скачанному файлу."""
+    records = [ember_record(i, label=i % 2) for i in range(4)]
+    local_tar = make_ember_tar(tmp_path / "manual" / "ember.tar.bz2", records)
+
+    state = NightState(path=tmp_path / "state.json")
+    settings = NightSettings(
+        ember_url=str(local_tar),
+        ember_tar_path=tmp_path / "downloads" / "ember.tar.bz2",  # отсутствует
+        state_path=state.path,
+        opener=make_fake_opener({}, []),  # сеть дёргаться не должна
+    )
+    got = list(EmberStream(settings, state).iter_records())
+    assert len(got) == 4
+
+
+def test_spawn_status_window_non_windows(tmp_path: Path) -> None:
+    import sys
+
+    if sys.platform == "win32":
+        pytest.skip("проверяется отказ только на не-Windows")
+    assert spawn_status_window(tmp_path / "status.json") is False

@@ -82,6 +82,11 @@ NIGHTLY_CSV: Path = Path(
     os.environ.get("AIAV_NIGHTLY_CSV", PROJECT_ROOT / "data" / "nightly" / "dataset.csv")
 )
 
+#: Живой статус автономной сессии (читает отдельное окно `autolearn-status`).
+NIGHTLY_STATUS: Path = Path(
+    os.environ.get("AIAV_NIGHTLY_STATUS", PROJECT_ROOT / "data" / "nightly" / "status.json")
+)
+
 # --------------------------------------------------------------------------- #
 # Пороги принятия решений
 # --------------------------------------------------------------------------- #
@@ -130,6 +135,7 @@ __all__ = [
     "DEFAULT_MODEL_FILENAME",
     "EMBER_URL",
     "NIGHTLY_CSV",
+    "NIGHTLY_STATUS",
     "MALICIOUS_THRESHOLD",
     "SUSPICIOUS_THRESHOLD",
     "MAX_FILE_SIZE_BYTES",

@@ -37,6 +37,8 @@ import bz2  # noqa: F401  (используется tarfile прозрачно)
 import csv
 import json
 import logging
+import subprocess
+import sys
 import tarfile
 import time
 import urllib.error
@@ -55,6 +57,8 @@ from aiav.config import (
     MALICIOUS_THRESHOLD,
     MODELS_DIR,
     NIGHTLY_CSV,
+    NIGHTLY_STATUS,
+    PROJECT_ROOT,
     RANDOM_STATE,
 )
 from aiav.features import (
@@ -120,11 +124,16 @@ class NightSettings:
     use_ember: bool = True
     ember_url: str = EMBER_URL
     distill_path: Path = DISTILL_PATH
-    downloads_dir: Path = Path("data") / "nightly" / "downloads"
-    state_path: Path = Path("data") / "nightly" / "state.json"
-    ember_tar_path: Path = Path("data") / "nightly" / "ember_dataset.tar.bz2"
+    downloads_dir: Path = PROJECT_ROOT / "data" / "nightly" / "downloads"
+    state_path: Path = PROJECT_ROOT / "data" / "nightly" / "state.json"
+    ember_tar_path: Path = PROJECT_ROOT / "data" / "nightly" / "ember_dataset.tar.bz2"
+    status_path: Path = NIGHTLY_STATUS
     benign_sources: Sequence[tuple[str, str]] = DEFAULT_BENIGN_SOURCES
     threshold: float = MALICIOUS_THRESHOLD
+    #: Базовая пауза после ошибки сбора (растёт линейно: 60 c, 120 c, …).
+    retry_backoff: float = 60.0
+    #: После стольких ошибок подряд EMBER отключается до конца запуска.
+    ember_fail_limit: int = 5
     opener: Opener = urllib.request.urlopen  # точка подмены для тестов
 
 
@@ -480,11 +489,20 @@ class EmberStream:
         self.state = state
 
     def ensure_downloaded(self) -> Path:
-        """Скачивает архив (с докачкой), если его ещё нет локально."""
+        """
+        Даёт локальный путь к архиву.
+
+        Порядок: уже скачанный файл -> ``ember_url`` как локальный путь
+        (можно скормить вручную скачанный архив) -> докачка из интернета.
+        """
         tar_path = self.settings.ember_tar_path
         if tar_path.exists() and tar_path.stat().st_size > 0:
             logger.info("EMBER-архив уже на диске: %s", tar_path)
             return tar_path
+        local = Path(self.settings.ember_url).expanduser()
+        if local.is_file():
+            logger.info("EMBER-архив взят с локального пути: %s", local)
+            return local
         return download_file(self.settings.ember_url, tar_path,
                              timeout=300, opener=self.settings.opener)
 
@@ -565,6 +583,9 @@ class NightTrainer:
         self.state = NightState.load(settings.state_path)
         self._rows_since_retrain = 0
         self._started = datetime.now(timezone.utc)
+        self._ember_disabled = False     # EMBER отключён после серии ошибок
+        self._consecutive_failures = 0   # ошибки сбора подряд (для бэкоффа)
+        self._best_cv: float | None = None  # кэш CV-F1 текущей модели
 
     # -- публичный API ------------------------------------------------------ #
 
@@ -594,32 +615,50 @@ class NightTrainer:
         logger.info("  строк в CSV    : %d (с прошлых запусков)", self.state.rows_added)
         logger.info("=" * 62)
 
+        self._best_cv = self._current_cv_f1()
+        self._write_status("старт")
         try:
             while not self._time_is_up():
                 self.state.epochs += 1
                 epoch = self.state.epochs
                 logger.info("--- ЭПОХА %d ---", epoch)
+                self._write_status(f"эпоха {epoch}")
+                collection_failed = False
                 try:
                     if self._collection_incomplete():
                         self._phase_benign()
-                        if settings.use_ember:
+                        if settings.use_ember and not self._ember_disabled:
                             self._phase_ember()
                     self._phase_merge_distill()
                     self._retrain(force=True, epoch=epoch)
                 except KeyboardInterrupt:
                     raise
                 except (OSError, tarfile.TarError) as exc:
+                    collection_failed = True
+                    self._consecutive_failures += 1
                     logger.error("Сбор данных прерван ошибкой: %s", exc)
-                    # не фатально: эпоха завершится переобучением накопленного
+                    self._handle_collection_failure(exc)
+                else:
+                    self._consecutive_failures = 0
                 self.state.save()
 
                 if settings.epochs and epoch >= settings.epochs:
                     break
                 if self._time_is_up():
                     break
-                if not self._collection_incomplete() and settings.epoch_pause > 0:
+
+                if collection_failed:
+                    # БЭКОФФ: не долбим источник ошибками — ждём всё дольше.
+                    pause = settings.retry_backoff * self._consecutive_failures
+                    logger.warning("Пауза %.0f c перед повтором (ошибок подряд: %d)",
+                                   pause, self._consecutive_failures)
+                    self._write_status(f"ожидание повтора ({pause:.0f} c)")
+                    if not self._sleep_responsive(min(pause, 3600.0)):
+                        break
+                elif not self._collection_incomplete() and settings.epoch_pause > 0:
                     logger.info("Все источники прочитаны — пауза %.0f c до следующей эпохи",
                                 settings.epoch_pause)
+                    self._write_status("пауза между эпохами")
                     if not self._sleep_responsive(settings.epoch_pause):
                         break
         except KeyboardInterrupt:
@@ -628,14 +667,38 @@ class NightTrainer:
             # «выключили» — дообучаем модель на всём, что успели собрать
             self._retrain(force=True, epoch=self.state.epochs)
             self.state.save()
+            self._write_status("остановлено", running=False)
             self._print_summary()
         return 0
+
+    def _handle_collection_failure(self, exc: Exception) -> None:
+        """Бэкофф-политика: после серии ошибок EMBER отключается до перезапуска."""
+        if self._consecutive_failures < self.settings.ember_fail_limit:
+            return
+        if self._ember_disabled or not self.settings.use_ember:
+            return
+        self._ember_disabled = True
+        logger.warning("=" * 62)
+        logger.warning("EMBER отключён до конца запуска: %d ошибок подряд",
+                       self._consecutive_failures)
+        logger.warning("Последняя ошибка: %s", exc)
+        logger.warning("Возможные причины и решения:")
+        logger.warning("  • HTTP 403/451 — CDN elastic.co блокирует ваш регион.")
+        logger.warning("    Скачайте архив вручную (браузер/другая сеть/VPN):")
+        logger.warning("    %s", self.settings.ember_url)
+        logger.warning("    и положите файл сюда: %s", self.settings.ember_tar_path)
+        logger.warning("  • или задайте зеркало: --ember-url <URL> (или AIAV_EMBER_URL)")
+        logger.warning("Сессия продолжит работу: benign-источники, метки scan --learn")
+        logger.warning("и переобучение накопленных данных.")
+        logger.warning("=" * 62)
 
     def _collection_incomplete(self) -> bool:
         """Есть ли ещё непрочитанные источники данных?"""
         if not self.state.benign_done:
             return True
-        return bool(self.settings.use_ember and not self.state.ember_exhausted)
+        return bool(self.settings.use_ember
+                    and not self._ember_disabled
+                    and not self.state.ember_exhausted)
 
     def _sleep_responsive(self, seconds: float) -> bool:
         """Спит, но следит за дедлайном. False — время вышло."""
@@ -645,6 +708,33 @@ class NightTrainer:
                 return False
             time.sleep(min(5.0, end - time.monotonic()))
         return True
+
+    def _write_status(self, phase: str = "", running: bool = True) -> None:
+        """
+        Пишет живой статус в ``status.json`` — его читает отдельное окно
+        ``python main.py autolearn-status --watch``.
+
+        Ошибки записи не фатальны: статус — удобство, а не часть конвейера.
+        """
+        now = datetime.now(timezone.utc)
+        payload = {
+            "running": running,
+            "started_at": self._started.isoformat(timespec="seconds"),
+            "elapsed_sec": round((now - self._started).total_seconds(), 1),
+            "epochs": self.state.epochs,
+            "rows_added": self.state.rows_added,
+            "retrains": self.state.retrains,
+            "phase": phase,
+            "cv_f1": self._best_cv,
+            "updated_at": now.isoformat(timespec="seconds"),
+        }
+        try:
+            self.settings.status_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.settings.status_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.settings.status_path)
+        except OSError as exc:
+            logger.debug("Не удалось записать статус: %s", exc)
 
     # -- фазы --------------------------------------------------------------- #
 
@@ -710,6 +800,7 @@ class NightTrainer:
     def _phase_ember(self) -> None:
         """Фаза 2: потоковая конвертация EMBER до дедлайна/лимита."""
         logger.info("--- ФАЗА 2/2: EMBER (признаки ~1 млн реальных PE) ---")
+        self._write_status("EMBER: скачивание/чтение архива")
         stream = EmberStream(self.settings, self.state)
         buffer: list[tuple[dict[str, float], int, str, str]] = []
         flush_every = 2_000
@@ -732,6 +823,7 @@ class NightTrainer:
 
     def _flush(self, buffer: list[tuple[dict[str, float], int, str, str]]) -> None:
         _append_rows(self.settings.csv_path, buffer)
+        self._write_status(f"EMBER: собрано {self.state.rows_added + len(buffer)} строк")
         self.state.rows_added += len(buffer)
         self._rows_since_retrain += len(buffer)
         if self.state.rows_added % 20_000 < 2_000:  # периодический чекпойнт
@@ -761,6 +853,7 @@ class NightTrainer:
 
         logger.info("--- ПЕРЕОБУЧЕНИЕ на %d строках (backend=%s) ---",
                     self.state.rows_added, self.settings.backend)
+        self._write_status("переобучение модели")
         try:
             classifier = MalwareClassifier(
                 backend=self.settings.backend,
@@ -785,6 +878,7 @@ class NightTrainer:
         if improved:
             try:
                 classifier.save(self.settings.model_path)
+                self._best_cv = metrics.cv_f1_mean
                 logger.info("Модель УЛУЧШЕНА: CV-F1 %.4f -> %.4f (сохранена)",
                             current_cv if current_cv is not None else 0.0,
                             metrics.cv_f1_mean)
@@ -821,6 +915,89 @@ class NightTrainer:
         logger.info("  текущий CV-F1 модели: %s", self._current_cv_f1())
         logger.info("  Продолжить: python main.py autolearn (прогресс сохранён)")
         logger.info("=" * 62)
+
+
+# --------------------------------------------------------------------------- #
+# Живой статус: файл + доска для отдельного окна
+# --------------------------------------------------------------------------- #
+
+
+def fmt_hms(seconds: float) -> str:
+    """Секунды -> ЧЧ:ММ:СС."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, sec = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
+
+def read_status(path: str | Path) -> dict[str, Any] | None:
+    """Читает status.json; ``None``, если файла нет или он битый."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def render_status(status: dict[str, Any], now: datetime | None = None) -> str:
+    """Рендерит человекочитаемую доску статуса (для отдельного окна)."""
+    now = now or datetime.now(timezone.utc)
+    running = bool(status.get("running"))
+    cv_f1 = status.get("cv_f1")
+
+    stale = ""
+    updated_raw = str(status.get("updated_at", ""))
+    try:
+        age = (now - datetime.fromisoformat(updated_raw)).total_seconds()
+        if running and age > 60:
+            stale = f"  (нет обновлений {int(age)} c)"
+    except ValueError:
+        pass
+
+    line = "═" * 46
+    rows = [
+        line,
+        "  AI-ANTIVIRUS · АВТОНОМНОЕ ОБУЧЕНИЕ",
+        line,
+        f"  Статус         : {'● РАБОТАЕТ' if running else '■ ОСТАНОВЛЕНО'}",
+        f"  Прошло времени : {fmt_hms(float(status.get('elapsed_sec', 0)))}",
+        f"  Эпох пройдено  : {status.get('epochs', 0)}",
+        f"  Строк собрано  : {status.get('rows_added', 0)}",
+        f"  Переобучений   : {status.get('retrains', 0)}",
+        f"  Фаза           : {status.get('phase') or '—'}",
+        f"  Лучший CV-F1   : {cv_f1:.4f}" if isinstance(cv_f1, (int, float))
+        else "  Лучший CV-F1   : —",
+        f"  Обновлено      : {updated_raw}{stale}",
+        line,
+    ]
+    return "\n".join(rows)
+
+
+def spawn_status_window(status_path: Path) -> bool:
+    """
+    На Windows открывает отдельное окно PowerShell с живой доской статуса.
+
+    Основной процесс продолжает писать полный лог в своё окно — отдельное
+    окно purely для удобства («сколько прошло времени / эпох»).
+    """
+    if sys.platform != "win32":
+        return False
+    main_py = PROJECT_ROOT / "main.py"
+    if not main_py.is_file():
+        return False
+    command = (
+        f"& '{sys.executable}' '{main_py}' autolearn-status --watch "
+        f"--status '{status_path}'"
+    )
+    try:
+        subprocess.Popen(  # noqa: S603 — фиксированная команда, свои же пути
+            ["powershell", "-NoExit", "-NoLogo", "-Command", command],
+            creationflags=0x00000010,  # CREATE_NEW_CONSOLE
+            close_fds=True,
+        )
+        return True
+    except OSError as exc:
+        logger.warning("Не удалось открыть окно статуса: %s", exc)
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -863,6 +1040,8 @@ def run_autolearn(
     retrain_every: int = 10_000,
     max_rows: int = 0,
     use_ember: bool = True,
+    ember_url: str | None = None,
+    status_window: bool = True,
 ) -> int:
     """CLI-обёртка: Ctrl+C завершает сессию корректно (код 130)."""
     try:
@@ -881,7 +1060,15 @@ def run_autolearn(
         retrain_every=max(100, retrain_every),
         max_rows=max(0, max_rows),
         use_ember=use_ember,
+        ember_url=ember_url or EMBER_URL,
     )
+
+    if status_window:
+        if spawn_status_window(settings.status_path):
+            logger.info("Открыто отдельное окно статуса (полный лог — в этом окне)")
+        elif sys.platform != "win32":
+            logger.info("Живой статус: python main.py autolearn-status --watch")
+
     trainer = NightTrainer(settings)
     try:
         return trainer.run()
@@ -904,6 +1091,10 @@ __all__ = [
     "compute_deadline",
     "download_file",
     "ember_record_to_features",
+    "fmt_hms",
+    "read_status",
+    "render_status",
     "run_autolearn",
     "run_overnight",
+    "spawn_status_window",
 ]
