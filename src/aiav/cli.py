@@ -43,6 +43,7 @@ from aiav.config import (  # noqa: E402
     MALICIOUS_THRESHOLD,
     MAX_FILE_SIZE_BYTES,
     MODELS_DIR,
+    NIGHTLY_CSV,
     QUARANTINE_DIR,
     REPORTS_DIR,
     SUSPICIOUS_THRESHOLD,
@@ -380,6 +381,24 @@ def cmd_trust(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_autolearn(args: argparse.Namespace) -> int:
+    """Подкоманда ``autolearn``: фоновое обучение из интернета (до Ctrl+C)."""
+    from aiav.overnight import run_autolearn
+
+    return run_autolearn(
+        hours=args.hours,
+        until=args.until,
+        epochs=args.epochs or None,
+        epoch_pause=args.epoch_pause,
+        csv_path=Path(args.csv).expanduser(),
+        model_path=Path(args.model).expanduser(),
+        backend=args.backend,
+        retrain_every=args.retrain_every,
+        max_rows=args.max_rows,
+        use_ember=not args.no_ember,
+    )
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """Подкоманда ``monitor``: фоновое наблюдение за каталогами."""
     from aiav.monitor import run_monitor
@@ -572,6 +591,34 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--no-encrypt", action="store_true",
                          help="хранить объекты карантина без шифрования")
     monitor.set_defaults(handler=cmd_monitor)
+
+    autolearn = subparsers.add_parser(
+        "autolearn", aliases=["overnight"],
+        help="фоновое обучение из интернета: EMBER + benign-бинарники, до Ctrl+C",
+    )
+    _add_common_flags(autolearn)
+    autolearn.add_argument("--hours", type=float, default=None,
+                           help="ограничить сессию N часами (по умолчанию — до остановки)")
+    autolearn.add_argument("--until", default=None, metavar="ЧЧ:ММ",
+                           help="учиться до указанного местного времени, напр. 07:00")
+    autolearn.add_argument("--epochs", type=int, default=0,
+                           help="предел эпох (0 = неограниченно, по умолчанию)")
+    autolearn.add_argument("--epoch-pause", type=float, default=300.0,
+                           help="пауза между эпохами в секундах (по умолчанию 300)")
+    autolearn.add_argument("--csv", default=str(NIGHTLY_CSV),
+                           help="CSV-датасет обучения (по умолчанию data/nightly/dataset.csv)")
+    autolearn.add_argument("--model", default=str(MODELS_DIR / DEFAULT_MODEL_FILENAME),
+                           help="куда сохранять улучшенную модель")
+    autolearn.add_argument("--backend", default=DEFAULT_BACKEND,
+                           choices=["random_forest", "lightgbm"],
+                           help="ML-бэкенд (lightgbm заметно быстрее на больших данных)")
+    autolearn.add_argument("--retrain-every", type=int, default=10000,
+                           help="переобучаться каждые N строк (по умолчанию 10000)")
+    autolearn.add_argument("--max-rows", type=int, default=0,
+                           help="предел строк данных (0 = без лимита, по умолчанию)")
+    autolearn.add_argument("--no-ember", action="store_true",
+                           help="не скачивать EMBER (только benign-бинарники)")
+    autolearn.set_defaults(handler=cmd_autolearn)
 
     # --- model-info ---
     info = subparsers.add_parser("model-info", help="сведения о модели")

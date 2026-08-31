@@ -69,6 +69,19 @@ DISTILL_PATH: Path = Path(
     os.environ.get("AIAV_DISTILL_CSV", PROJECT_ROOT / "data" / "distill" / "dataset.csv")
 )
 
+#: URL EMBER-датасета: ИЗВЛЕЧЁННЫЕ признаки ~1 млн реальных PE-файлов
+#: с метками консенсуса VirusTotal. Самих malware-файлов там нет —
+#: это легальный способ «учиться из интернета», не скачивая образцы.
+EMBER_URL: str = os.environ.get(
+    "AIAV_EMBER_URL", "https://ember.elastic.co/ember_dataset_2018_2.tar.bz2"
+)
+
+#: CSV ночного обучения — накапливается командой `overnight`,
+#: пригоден для ручного переобучения: `train --csv <путь>`.
+NIGHTLY_CSV: Path = Path(
+    os.environ.get("AIAV_NIGHTLY_CSV", PROJECT_ROOT / "data" / "nightly" / "dataset.csv")
+)
+
 # --------------------------------------------------------------------------- #
 # Пороги принятия решений
 # --------------------------------------------------------------------------- #
@@ -115,6 +128,8 @@ __all__ = [
     "QUARANTINE_DIR",
     "REPORTS_DIR",
     "DEFAULT_MODEL_FILENAME",
+    "EMBER_URL",
+    "NIGHTLY_CSV",
     "MALICIOUS_THRESHOLD",
     "SUSPICIOUS_THRESHOLD",
     "MAX_FILE_SIZE_BYTES",
