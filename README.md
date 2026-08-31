@@ -98,27 +98,51 @@ ai-antivirus/
 
 ## 🚀 Быстрый старт
 
-```bash
-# 1. Клонировать и создать окружение
-git clone https://github.com/<ваш-аккаунт>/ai-antivirus.git
-cd ai-antivirus
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+> 📁 Папка после клонирования называется так же, как репозиторий
+> (например, `AI-Antivirus-Prototype`), — заходите в неё, а не в
+> `ai-antivirus` из примеров ниже.
 
-# 2. Установить зависимости
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/<ваш-аккаунт>/AI-Antivirus-Prototype.git
+cd AI-Antivirus-Prototype
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1        # в начале строки появится (.venv)
+# Если PowerShell запрещает выполнение скриптов — один раз разрешите:
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+
 pip install -r requirements.txt
 
-# 3. Сгенерировать учебный датасет (120 синтетических PE)
+python tools\generate_samples.py --out data\samples --per-class 60
+python main.py train --dataset data\samples
+python main.py scan $env:USERPROFILE\Downloads --dry-run
+```
+
+> 💡 Не получается активировать venv? Работайте без активации, полными путями:
+> `.\.venv\Scripts\python.exe main.py train --dataset data\samples`
+
+### Linux / macOS (bash/zsh)
+
+```bash
+git clone https://github.com/<ваш-аккаунт>/AI-Antivirus-Prototype.git
+cd AI-Antivirus-Prototype
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+
 python tools/generate_samples.py --out data/samples --per-class 60
-
-# 4. Обучить модель
 python main.py train --dataset data/samples --backend random_forest
-
-# 5. Просканировать каталог (сначала — безопасно, без перемещения файлов)
 python main.py scan ~/Downloads --dry-run
+```
 
-# 6. Боевой режим: вредоносные файлы уходят в карантин
-python main.py scan ~/Downloads --action quarantine
+Боевой режим — вредоносные файлы уходят в карантин:
+
+```
+python main.py scan <каталог> --action quarantine
 ```
 
 > **Проверено:** Python 3.13.14, scikit-learn 1.6.1, pefile 2024.8.26,
