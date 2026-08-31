@@ -39,6 +39,7 @@ from aiav.config import (  # noqa: E402
     DEFAULT_BACKEND,
     DEFAULT_MODEL_FILENAME,
     MALICIOUS_THRESHOLD,
+    MAX_FILE_SIZE_BYTES,
     MODELS_DIR,
     QUARANTINE_DIR,
     REPORTS_DIR,
@@ -146,6 +147,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         malicious_threshold=args.malicious_threshold,
         dry_run=args.dry_run,
         model_path=model_path,
+        max_file_size=(
+            int(args.max_file_size * 1024 * 1024)
+            if args.max_file_size is not None
+            else MAX_FILE_SIZE_BYTES
+        ),
     )
 
     try:
@@ -364,6 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="сколько строк таблицы выводить в консоль")
     scan.add_argument("--lenient", action="store_true",
                       help="не падать при несовпадении схемы признаков модели")
+    scan.add_argument("--max-file-size", type=float, default=None, metavar="MB",
+                      help=f"лимит размера разбираемого файла в МБ "
+                           f"(по умолчанию {MAX_FILE_SIZE_BYTES // (1024 * 1024)}; "
+                           f"крупные инсталляторы пропускаются с предупреждением)")
     scan.set_defaults(handler=cmd_scan)
 
     # --- train ---

@@ -208,3 +208,27 @@ def test_report_records_model_path(
     written = FileScanner.save_report(summary, tmp_path / "r")
     payload = json.loads(written["json"].read_text(encoding="utf-8"))
     assert payload["model_path"] == "/models/test-model.joblib"
+
+
+def test_max_file_size_skips_large_files(
+    classifier: MalwareClassifier, tmp_path: Path, quarantine_dir: Path, benign_exe: Path
+) -> None:
+    """Файл крупнее лимита не разбирается и не попадает в результаты."""
+    root = tmp_path / "big"
+    root.mkdir()
+    small = root / "small.exe"
+    small.write_bytes(benign_exe.read_bytes())
+
+    oversized = root / "oversized.exe"
+    # валидный MZ-заголовок + «хвост», чтобы превысить лимит в 16 КБ
+    oversized.write_bytes(benign_exe.read_bytes() + b"\x00" * (32 * 1024))
+
+    scanner = FileScanner(
+        classifier, QuarantineManager(quarantine_dir), action="report",
+        max_file_size=16 * 1024,
+    )
+    summary = scanner.scan_paths([root])
+    assert summary.scanned == 1                      # разобрался только маленький
+    paths = {r.path for r in summary.results}
+    assert any("small.exe" in p for p in paths)
+    assert not any("oversized.exe" in p for p in paths)
