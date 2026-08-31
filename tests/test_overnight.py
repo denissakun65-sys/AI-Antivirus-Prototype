@@ -379,7 +379,7 @@ def test_trainer_two_epochs_end_to_end(tmp_path: Path, benign_exe: Path) -> None
     assert trainer.run() == 0
     state = NightState.load(settings.state_path)
 
-    assert state.epochs == 2
+    assert state.epochs >= 2
     assert state.rows_added == 120 + 1 + 2   # EMBER + benign + distill
     assert state.distill_merged == 2
     assert state.ember_exhausted is True
@@ -394,14 +394,18 @@ def test_trainer_two_epochs_end_to_end(tmp_path: Path, benign_exe: Path) -> None
     dataset = clf.load_dataset_from_csv(settings.csv_path)
     assert len(dataset) == 123
 
-    # второй запуск: benign не перекачивается, EMBER не перечитывается
+    # второй запуск: benign не перекачивается, EMBER не перечитывается,
+    # новых данных нет -> переобучение пропускается (быстрые эпохи)
+    retrains_before = state.retrains
     before = state.rows_added
     trainer2 = NightTrainer(_trainer_settings(tmp_path, benign_exe.read_bytes(),
                                               epochs=3))
     assert trainer2.run() == 0
     after = NightState.load(settings.state_path)
     assert after.rows_added == before        # новых данных нет
-    assert after.epochs == 3
+    assert after.epochs > state.epochs       # пустые эпохи всё равно идут
+    # финальный «дообуч» не запускался: необученных строк не осталось
+    assert after.retrains == retrains_before
 
 
 def test_trainer_never_degrades_existing_model(tmp_path: Path, benign_exe: Path) -> None:
@@ -429,7 +433,13 @@ def test_trainer_never_degrades_existing_model(tmp_path: Path, benign_exe: Path)
     settings_noisy = _trainer_settings(tmp_path, benign_exe.read_bytes(),
                                        epochs=1, csv_path=noise_csv,
                                        model_path=settings.model_path,
-                                       use_ember=False, benign_sources=())
+                                       use_ember=False, benign_sources=(),
+                                       state_path=tmp_path / "noisy_state.json")
+    # состояние: 60 строк собрано, но ещё не обучено — финальный дообуч запустится
+    preset = NightState(path=settings_noisy.state_path)
+    preset.rows_added = 60
+    preset.benign_done = True
+    preset.save()
     NightTrainer(settings_noisy).run()
 
     digest_after = hashlib.sha256(settings.model_path.read_bytes()).hexdigest()
@@ -490,8 +500,9 @@ def test_read_status_missing_returns_none(tmp_path: Path) -> None:
     assert read_status(tmp_path / "nope.json") is None
 
 
-def test_backoff_and_ember_autodisable(tmp_path: Path, benign_exe: Path) -> None:
-    """EMBER недоступен: бэкофф + автоотключение вместо бесконечных ошибок."""
+def test_permanent_403_disables_ember_immediately(tmp_path: Path,
+                                                   benign_exe: Path) -> None:
+    """HTTP 403 — постоянная ошибка: EMBER отключается с ПЕРВОЙ попытки."""
     seen: list = []
 
     def failing_opener(request, timeout=None):  # noqa: ARG001
@@ -503,19 +514,44 @@ def test_backoff_and_ember_autodisable(tmp_path: Path, benign_exe: Path) -> None
 
     settings = _trainer_settings(
         tmp_path, benign_exe.read_bytes(),
-        epochs=4, epoch_pause=0.0,
+        epochs=3, epoch_pause=0.0,
         ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
-        ember_fail_limit=2,
         opener=failing_opener,
     )
     trainer = NightTrainer(settings)
     assert trainer.run() == 0
 
     ember_attempts = [u for u in seen if u.endswith(".tar.bz2")]
-    assert len(ember_attempts) == 2      # после 2 ошибок подряд — отключён
+    assert len(ember_attempts) == 1      # никаких пяти повторов при 403
     assert trainer._ember_disabled is True  # noqa: SLF001
     state = NightState.load(settings.state_path)
-    assert state.epochs == 4             # сессия дошла до конца без EMBER
+    assert state.epochs >= 3             # сессия продолжила работу без EMBER
+
+
+def test_transient_errors_get_backoff_then_disable(tmp_path: Path,
+                                                   benign_exe: Path) -> None:
+    """Сетевой сбой (не HTTP-код) — бэкофф, отключение после лимита."""
+    seen: list = []
+
+    def flaky_opener(request, timeout=None):  # noqa: ARG001
+        seen.append(request.full_url)
+        if request.full_url.endswith(".tar.bz2"):
+            raise urllib.error.URLError("connection timed out")
+        return FakeResponse(benign_exe.read_bytes())
+
+    settings = _trainer_settings(
+        tmp_path, benign_exe.read_bytes(),
+        epochs=4, epoch_pause=0.0,
+        ember_tar_path=tmp_path / "absent" / "ember.tar.bz2",
+        ember_fail_limit=2,
+        opener=flaky_opener,
+    )
+    trainer = NightTrainer(settings)
+    assert trainer.run() == 0
+
+    ember_attempts = [u for u in seen if u.endswith(".tar.bz2")]
+    assert len(ember_attempts) == 2      # ровно лимит, затем отключение
+    assert trainer._ember_disabled is True  # noqa: SLF001
 
 
 def test_ember_stream_accepts_local_archive(tmp_path: Path) -> None:

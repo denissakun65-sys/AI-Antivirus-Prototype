@@ -639,8 +639,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="учиться до указанного местного времени, напр. 07:00")
     autolearn.add_argument("--epochs", type=int, default=0,
                            help="предел эпох (0 = неограниченно, по умолчанию)")
-    autolearn.add_argument("--epoch-pause", type=float, default=300.0,
-                           help="пауза между эпохами в секундах (по умолчанию 300)")
+    autolearn.add_argument("--epoch-pause", type=float, default=60.0,
+                           help="пауза между пустыми эпохами в секундах (по умолчанию 60)")
     autolearn.add_argument("--csv", default=str(NIGHTLY_CSV),
                            help="CSV-датасет обучения (по умолчанию data/nightly/dataset.csv)")
     autolearn.add_argument("--model", default=str(MODELS_DIR / DEFAULT_MODEL_FILENAME),

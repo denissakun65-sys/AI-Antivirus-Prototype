@@ -98,6 +98,14 @@ _SIZEOF_OPT_HEADER_PE64 = 224.0
 #: Тип сетевой функции-«открывателя» (подменяется в тестах).
 Opener = Callable[..., Any]
 
+#: HTTP-коды, которые сами не проходят (блокировка региона, нет файла и т.п.) —
+#: повторять запрос бессмысленно, источник отключается сразу.
+_PERMANENT_HTTP_CODES: frozenset[int] = frozenset({401, 403, 404, 405, 410, 451})
+
+
+class PermanentDownloadError(OSError):
+    """Постоянная ошибка скачивания — повторы не помогут (403/404/451…)."""
+
 
 # --------------------------------------------------------------------------- #
 # Настройки и состояние ночной сессии
@@ -115,7 +123,7 @@ class NightSettings:
 
     deadline: datetime | None = None
     epochs: int | None = None
-    epoch_pause: float = 300.0
+    epoch_pause: float = 60.0
     csv_path: Path = NIGHTLY_CSV
     model_path: Path = MODELS_DIR / DEFAULT_MODEL_FILENAME
     backend: str = DEFAULT_BACKEND
@@ -160,6 +168,7 @@ class NightState:
     epochs: int = 0
     distill_merged: int = 0        # сколько строк DISTILL уже перенесено
     ember_exhausted: bool = False  # EMBER прочитан целиком
+    rows_trained: int = 0          # строк в CSV на момент последней тренировки
 
     @classmethod
     def load(cls, path: str | Path) -> NightState:
@@ -176,6 +185,7 @@ class NightState:
                 state.epochs = int(raw.get("epochs", 0))
                 state.distill_merged = int(raw.get("distill_merged", 0))
                 state.ember_exhausted = bool(raw.get("ember_exhausted", False))
+                state.rows_trained = int(raw.get("rows_trained", 0))
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("Состояние повреждено (%s) — начинаем с чистого", exc)
         return state
@@ -190,6 +200,7 @@ class NightState:
             "epochs": self.epochs,
             "distill_merged": self.distill_merged,
             "ember_exhausted": self.ember_exhausted,
+            "rows_trained": self.rows_trained,
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         try:
@@ -230,6 +241,11 @@ def download_file(
 
     try:
         response = opener(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        message = f"не удалось открыть {url}: HTTP Error {exc.code}: {exc.reason}"
+        if exc.code in _PERMANENT_HTTP_CODES:
+            raise PermanentDownloadError(message) from exc
+        raise OSError(message) from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise OSError(f"не удалось открыть {url}: {exc}") from exc
 
@@ -619,18 +635,20 @@ class NightTrainer:
         self._write_status("старт")
         try:
             while not self._time_is_up():
-                self.state.epochs += 1
-                epoch = self.state.epochs
-                logger.info("--- ЭПОХА %d ---", epoch)
-                self._write_status(f"эпоха {epoch}")
+                epoch = self._begin_epoch()
                 collection_failed = False
+                rows_before = self.state.rows_added
                 try:
                     if self._collection_incomplete():
                         self._phase_benign()
                         if settings.use_ember and not self._ember_disabled:
                             self._phase_ember()
                     self._phase_merge_distill()
-                    self._retrain(force=True, epoch=epoch)
+                    if self.state.rows_added != rows_before:
+                        self._retrain(force=True, epoch=epoch)
+                    else:
+                        # быстрая эпоха: данных не прибавилось — тренировать нечего
+                        logger.info("Новых данных нет — переобучение пропущено")
                 except KeyboardInterrupt:
                     raise
                 except (OSError, tarfile.TarError) as exc:
@@ -664,23 +682,38 @@ class NightTrainer:
         except KeyboardInterrupt:
             raise
         finally:
-            # «выключили» — дообучаем модель на всём, что успели собрать
-            self._retrain(force=True, epoch=self.state.epochs)
+            # «выключили» — дообучаем модель, если собраны не все строки
+            if self.state.rows_added != self.state.rows_trained:
+                self._retrain(force=True, epoch=self.state.epochs)
             self.state.save()
             self._write_status("остановлено", running=False)
             self._print_summary()
         return 0
 
+    def _begin_epoch(self) -> int:
+        """Открывает новую эпоху: счётчик, лог, статус. Возвращает её номер."""
+        self.state.epochs += 1
+        logger.info("--- ЭПОХА %d ---", self.state.epochs)
+        self._write_status(f"эпоха {self.state.epochs}")
+        return self.state.epochs
+
     def _handle_collection_failure(self, exc: Exception) -> None:
-        """Бэкофф-политика: после серии ошибок EMBER отключается до перезапуска."""
-        if self._consecutive_failures < self.settings.ember_fail_limit:
+        """
+        Политика отказов: постоянные ошибки (403/451/404) отключают EMBER
+        СРАЗУ — повторять их бессмысленно; временные (сеть, таймауты)
+        получают бэкофф и отключение только после серии неудач.
+        """
+        if not isinstance(exc, PermanentDownloadError) \
+                and self._consecutive_failures < self.settings.ember_fail_limit:
             return
         if self._ember_disabled or not self.settings.use_ember:
             return
         self._ember_disabled = True
         logger.warning("=" * 62)
-        logger.warning("EMBER отключён до конца запуска: %d ошибок подряд",
-                       self._consecutive_failures)
+        logger.warning("EMBER отключён до конца запуска (%s)",
+                       "постоянная ошибка — повторы бессмысленны"
+                       if isinstance(exc, PermanentDownloadError)
+                       else f"{self._consecutive_failures} ошибок подряд")
         logger.warning("Последняя ошибка: %s", exc)
         logger.warning("Возможные причины и решения:")
         logger.warning("  • HTTP 403/451 — CDN elastic.co блокирует ваш регион.")
@@ -829,7 +862,9 @@ class NightTrainer:
         if self.state.rows_added % 20_000 < 2_000:  # периодический чекпойнт
             self.state.save()
         if self._rows_since_retrain >= self.settings.retrain_every:
-            self._retrain()
+            # эпохи идут и во время сбора: «собрал 10k -> обучил» = эпоха
+            self._begin_epoch()
+            self._retrain(epoch=self.state.epochs)
 
     # -- переобучение -------------------------------------------------------- #
 
@@ -873,6 +908,7 @@ class NightTrainer:
             logger.exception("Переобучение упало с непредвиденной ошибкой")
             return
 
+        self.state.rows_trained = self.state.rows_added
         current_cv = self._current_cv_f1()
         improved = current_cv is None or metrics.cv_f1_mean > current_cv + 1e-6
         if improved:
@@ -1033,7 +1069,7 @@ def run_autolearn(
     hours: float | None = None,
     until: str | None = None,
     epochs: int | None = None,
-    epoch_pause: float = 300.0,
+    epoch_pause: float = 60.0,
     csv_path: Path = NIGHTLY_CSV,
     model_path: Path | None = None,
     backend: str = DEFAULT_BACKEND,
